@@ -3,26 +3,27 @@
 TransUNet Fine-tuning Script for Vesuvius Surface Detection
 
 3D segmentation of papyrus surfaces in CT scans of Herculaneum scrolls.
+PyTorch + CUDA implementation.
 """
 
 import argparse
 import json
 import logging
-import os
+import math
 import random
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-os.environ["KERAS_BACKEND"] = "jax"
-
-import keras
 import numpy as np
 import pandas as pd
 import tifffile
-from medicai.models import TransUNet
-from medicai.transforms import Compose, NormalizeIntensity
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -74,7 +75,7 @@ class TrainConfig:
     full_input_shape: tuple = field(init=False)
 
     def __post_init__(self):
-        self.full_input_shape = (*self.input_shape, 1)
+        self.full_input_shape = (1, *self.input_shape)  # (C, D, H, W)
 
         if not self.experiment_name:
             self.experiment_name = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -86,6 +87,16 @@ def set_seed(seed: int):
     """Set random seeds for reproducibility."""
     random.seed(seed)
     np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def get_device():
+    """Get the best available device."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
 
 
 def load_volume(path: str) -> np.ndarray:
@@ -95,15 +106,14 @@ def load_volume(path: str) -> np.ndarray:
 
 
 def normalize_volume(volume: np.ndarray) -> np.ndarray:
-    """Apply intensity normalization."""
-    data = {"image": volume}
-    pipeline = Compose(
-        [
-            NormalizeIntensity(keys=["image"], nonzero=True, channel_wise=False),
-        ]
-    )
-    result = pipeline(data)
-    return result["image"]
+    """Apply intensity normalization (nonzero mean/std)."""
+    nonzero_mask = volume > 0
+    if nonzero_mask.sum() > 0:
+        mean = volume[nonzero_mask].mean()
+        std = volume[nonzero_mask].std()
+        if std > 0:
+            volume = (volume - mean) / std
+    return volume
 
 
 def extract_random_patch(
@@ -203,8 +213,8 @@ class VesuviusDataset:
             return len(self.valid_ids) * self.config.num_patches_per_volume
         return len(self.valid_ids)
 
-    def get_batch(self, batch_indices: list) -> tuple:
-        """Get a batch of patches."""
+    def get_batch(self, batch_indices: list, device: torch.device) -> tuple:
+        """Get a batch of patches as tensors."""
         batch_x = []
         batch_y = []
 
@@ -263,85 +273,322 @@ class VesuviusDataset:
                     vol_patch = vol_padded
                     mask_patch = mask_padded
 
-            # Add channel dimension: (D, H, W) -> (D, H, W, 1)
-            batch_x.append(vol_patch[..., np.newaxis])
+            # Add channel dimension: (D, H, W) -> (1, D, H, W)
+            batch_x.append(vol_patch[np.newaxis, ...])
             batch_y.append(mask_patch)
 
-        return np.array(batch_x), np.array(batch_y)
+        x = torch.from_numpy(np.array(batch_x)).to(device)
+        y = torch.from_numpy(np.array(batch_y)).long().to(device)
+        return x, y
 
 
-def dice_loss(y_true, y_pred, smooth=1e-6):
-    """Compute Dice loss for multi-class segmentation."""
-    # y_pred: (B, D, H, W, C) logits or probs
-    # y_true: (B, D, H, W) integer labels
+# =============================================================================
+# 3D UNet with Transformer (TransUNet-style) for PyTorch
+# =============================================================================
 
-    y_pred = keras.ops.softmax(y_pred, axis=-1)
-    y_true_onehot = keras.ops.one_hot(keras.ops.cast(y_true, "int32"), y_pred.shape[-1])
 
-    # Ignore label 2 (unlabeled) by zeroing its contribution
-    # Create mask for valid labels (0 and 1)
-    valid_mask = keras.ops.cast(y_true < 2, y_pred.dtype)
-    valid_mask = keras.ops.expand_dims(valid_mask, axis=-1)
+class ConvBlock3D(nn.Module):
+    """3D convolutional block with batch norm and ReLU."""
 
-    intersection = keras.ops.sum(y_true_onehot * y_pred * valid_mask, axis=(1, 2, 3))
-    union = keras.ops.sum((y_true_onehot + y_pred) * valid_mask, axis=(1, 2, 3))
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv1 = nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm3d(out_channels)
+        self.conv2 = nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm3d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.relu(self.bn2(self.conv2(x)))
+        return x
+
+
+class SEBlock3D(nn.Module):
+    """Squeeze-and-Excitation block for 3D."""
+
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.fc1 = nn.Linear(channels, channels // reduction)
+        self.fc2 = nn.Linear(channels // reduction, channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        b, c, d, h, w = x.shape
+        y = x.view(b, c, -1).mean(dim=2)
+        y = self.relu(self.fc1(y))
+        y = self.sigmoid(self.fc2(y))
+        y = y.view(b, c, 1, 1, 1)
+        return x * y
+
+
+class ResBlock3D(nn.Module):
+    """Residual block with SE attention."""
+
+    def __init__(self, in_channels, out_channels, stride=1):
+        super().__init__()
+        self.conv1 = nn.Conv3d(
+            in_channels, out_channels, kernel_size=3, stride=stride, padding=1
+        )
+        self.bn1 = nn.BatchNorm3d(out_channels)
+        self.conv2 = nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm3d(out_channels)
+        self.se = SEBlock3D(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv3d(in_channels, out_channels, kernel_size=1, stride=stride),
+                nn.BatchNorm3d(out_channels),
+            )
+
+    def forward(self, x):
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = self.se(out)
+        out += self.shortcut(x)
+        out = self.relu(out)
+        return out
+
+
+class TransformerBlock(nn.Module):
+    """Transformer encoder block."""
+
+    def __init__(self, embed_dim, num_heads, mlp_ratio=4.0, dropout=0.1):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.attn = nn.MultiheadAttention(
+            embed_dim, num_heads, dropout=dropout, batch_first=True
+        )
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, int(embed_dim * mlp_ratio)),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(int(embed_dim * mlp_ratio), embed_dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        x_norm = self.norm1(x)
+        x = x + self.attn(x_norm, x_norm, x_norm)[0]
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+class TransUNet3D(nn.Module):
+    """
+    3D TransUNet: UNet with Transformer bottleneck.
+    Simplified implementation for 3D medical image segmentation.
+    """
+
+    def __init__(
+        self,
+        in_channels=1,
+        num_classes=3,
+        base_channels=32,
+        num_transformer_layers=4,
+        num_heads=8,
+        classifier_activation=None,
+    ):
+        super().__init__()
+        self.classifier_activation = classifier_activation
+
+        # Encoder
+        self.enc1 = ConvBlock3D(in_channels, base_channels)
+        self.pool1 = nn.MaxPool3d(2)
+
+        self.enc2 = ResBlock3D(base_channels, base_channels * 2)
+        self.pool2 = nn.MaxPool3d(2)
+
+        self.enc3 = ResBlock3D(base_channels * 2, base_channels * 4)
+        self.pool3 = nn.MaxPool3d(2)
+
+        self.enc4 = ResBlock3D(base_channels * 4, base_channels * 8)
+        self.pool4 = nn.MaxPool3d(2)
+
+        # Bottleneck with Transformer
+        self.bottleneck_conv = ConvBlock3D(base_channels * 8, base_channels * 16)
+
+        # Transformer layers
+        embed_dim = base_channels * 16
+        self.transformer_layers = nn.ModuleList(
+            [
+                TransformerBlock(embed_dim, num_heads)
+                for _ in range(num_transformer_layers)
+            ]
+        )
+        self.transformer_norm = nn.LayerNorm(embed_dim)
+
+        # Decoder
+        self.up4 = nn.ConvTranspose3d(
+            base_channels * 16, base_channels * 8, kernel_size=2, stride=2
+        )
+        self.dec4 = ConvBlock3D(base_channels * 16, base_channels * 8)
+
+        self.up3 = nn.ConvTranspose3d(
+            base_channels * 8, base_channels * 4, kernel_size=2, stride=2
+        )
+        self.dec3 = ConvBlock3D(base_channels * 8, base_channels * 4)
+
+        self.up2 = nn.ConvTranspose3d(
+            base_channels * 4, base_channels * 2, kernel_size=2, stride=2
+        )
+        self.dec2 = ConvBlock3D(base_channels * 4, base_channels * 2)
+
+        self.up1 = nn.ConvTranspose3d(
+            base_channels * 2, base_channels, kernel_size=2, stride=2
+        )
+        self.dec1 = ConvBlock3D(base_channels * 2, base_channels)
+
+        # Output
+        self.out_conv = nn.Conv3d(base_channels, num_classes, kernel_size=1)
+
+    def forward(self, x):
+        # Encoder
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool1(e1))
+        e3 = self.enc3(self.pool2(e2))
+        e4 = self.enc4(self.pool3(e3))
+
+        # Bottleneck
+        b = self.bottleneck_conv(self.pool4(e4))
+
+        # Reshape for transformer: (B, C, D, H, W) -> (B, D*H*W, C)
+        b_shape = b.shape
+        b_flat = b.flatten(2).transpose(1, 2)
+
+        # Transformer layers
+        for layer in self.transformer_layers:
+            b_flat = layer(b_flat)
+        b_flat = self.transformer_norm(b_flat)
+
+        # Reshape back: (B, D*H*W, C) -> (B, C, D, H, W)
+        b = b_flat.transpose(1, 2).view(b_shape)
+
+        # Decoder with skip connections
+        d4 = self.up4(b)
+        d4 = torch.cat([d4, e4], dim=1)
+        d4 = self.dec4(d4)
+
+        d3 = self.up3(d4)
+        d3 = torch.cat([d3, e3], dim=1)
+        d3 = self.dec3(d3)
+
+        d2 = self.up2(d3)
+        d2 = torch.cat([d2, e2], dim=1)
+        d2 = self.dec2(d2)
+
+        d1 = self.up1(d2)
+        d1 = torch.cat([d1, e1], dim=1)
+        d1 = self.dec1(d1)
+
+        out = self.out_conv(d1)
+
+        if self.classifier_activation == "softmax":
+            out = F.softmax(out, dim=1)
+
+        return out
+
+
+def dice_loss(y_pred: torch.Tensor, y_true: torch.Tensor, smooth: float = 1e-6):
+    """
+    Compute Dice loss for multi-class segmentation.
+
+    Args:
+        y_pred: (B, C, D, H, W) logits
+        y_true: (B, D, H, W) integer labels
+    """
+    num_classes = y_pred.shape[1]
+    y_pred_soft = F.softmax(y_pred, dim=1)
+
+    # One-hot encode targets
+    y_true_onehot = F.one_hot(y_true.clamp(0, num_classes - 1), num_classes)
+    y_true_onehot = y_true_onehot.permute(0, 4, 1, 2, 3).float()  # (B, C, D, H, W)
+
+    # Create mask for valid labels (0 and 1, not 2=unlabeled)
+    valid_mask = (y_true < 2).unsqueeze(1).float()  # (B, 1, D, H, W)
+
+    # Compute dice per class
+    intersection = (y_true_onehot * y_pred_soft * valid_mask).sum(dim=(2, 3, 4))
+    union = ((y_true_onehot + y_pred_soft) * valid_mask).sum(dim=(2, 3, 4))
 
     dice = (2.0 * intersection + smooth) / (union + smooth)
 
-    # Average over classes (excluding background optionally)
-    return 1.0 - keras.ops.mean(dice[:, 1:])  # Exclude background class
+    # Average over classes, excluding background (class 0)
+    return 1.0 - dice[:, 1:].mean()
 
 
-def ce_loss(y_true, y_pred, label_smoothing=0.0):
-    """Compute cross-entropy loss ignoring unlabeled pixels."""
-    # y_pred: (B, D, H, W, C) logits
-    # y_true: (B, D, H, W) integer labels
+def ce_loss(
+    y_pred: torch.Tensor, y_true: torch.Tensor, label_smoothing: float = 0.0
+):
+    """
+    Compute cross-entropy loss ignoring unlabeled pixels.
+
+    Args:
+        y_pred: (B, C, D, H, W) logits
+        y_true: (B, D, H, W) integer labels
+    """
+    num_classes = y_pred.shape[1]
 
     # Create mask for valid labels (not 2 = unlabeled)
-    valid_mask = keras.ops.cast(y_true < 2, "float32")
+    valid_mask = (y_true < 2).float()
 
-    # Flatten for loss computation
-    y_pred_flat = keras.ops.reshape(y_pred, (-1, y_pred.shape[-1]))
-    y_true_flat = keras.ops.reshape(y_true, (-1,))
-    valid_mask_flat = keras.ops.reshape(valid_mask, (-1,))
-
-    # Clamp labels to valid range for loss computation
-    y_true_clamped = keras.ops.clip(y_true_flat, 0, y_pred.shape[-1] - 1)
+    # Clamp labels to valid range
+    y_true_clamped = y_true.clamp(0, num_classes - 1)
 
     # Compute per-pixel loss
-    loss = keras.ops.sparse_categorical_crossentropy(
-        y_true_clamped,
-        y_pred_flat,
-        from_logits=True,
+    loss = F.cross_entropy(
+        y_pred, y_true_clamped, reduction="none", label_smoothing=label_smoothing
     )
 
     # Apply mask and compute mean
-    masked_loss = loss * valid_mask_flat
-    return keras.ops.sum(masked_loss) / (keras.ops.sum(valid_mask_flat) + 1e-6)
+    masked_loss = loss * valid_mask
+    return masked_loss.sum() / (valid_mask.sum() + 1e-6)
 
 
-def combo_loss(y_true, y_pred, dice_weight=0.5, ce_weight=0.5, label_smoothing=0.0):
+def combo_loss(
+    y_pred: torch.Tensor,
+    y_true: torch.Tensor,
+    dice_weight: float = 0.5,
+    ce_weight: float = 0.5,
+    label_smoothing: float = 0.0,
+):
     """Combined Dice + Cross-Entropy loss."""
-    d_loss = dice_loss(y_true, y_pred)
-    c_loss = ce_loss(y_true, y_pred, label_smoothing)
+    d_loss = dice_loss(y_pred, y_true)
+    c_loss = ce_loss(y_pred, y_true, label_smoothing)
     return dice_weight * d_loss + ce_weight * c_loss
 
 
-def get_model(config: TrainConfig):
+def get_model(config: TrainConfig, device: torch.device) -> nn.Module:
     """Create and return the model."""
-    model = TransUNet(
-        input_shape=config.full_input_shape,
-        encoder_name=config.encoder_name,
-        classifier_activation=config.classifier_activation,
+    model = TransUNet3D(
+        in_channels=1,
         num_classes=config.num_classes,
+        base_channels=32,
+        num_transformer_layers=4,
+        num_heads=8,
+        classifier_activation=config.classifier_activation,
     )
-    return model
+    return model.to(device)
 
 
+def count_parameters(model: nn.Module) -> int:
+    """Count trainable parameters."""
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+@torch.no_grad()
 def compute_val_metrics(
-    model, val_dataset: VesuviusDataset, config: TrainConfig
+    model: nn.Module,
+    val_dataset: VesuviusDataset,
+    config: TrainConfig,
+    device: torch.device,
 ) -> dict:
     """Compute validation metrics."""
+    model.eval()
     total_loss = 0.0
     total_dice = 0.0
     num_samples = 0
@@ -350,29 +597,29 @@ def compute_val_metrics(
 
     for i in range(0, len(indices), config.batch_size):
         batch_indices = indices[i : i + config.batch_size]
-        x_batch, y_batch = val_dataset.get_batch(batch_indices)
+        x_batch, y_batch = val_dataset.get_batch(batch_indices, device)
 
         # Forward pass
-        y_pred = model(x_batch, training=False)
+        y_pred = model(x_batch)
 
         # Compute losses
         if config.loss == "dice":
-            loss = dice_loss(y_batch, y_pred)
+            loss = dice_loss(y_pred, y_batch)
         elif config.loss == "ce":
-            loss = ce_loss(y_batch, y_pred, config.label_smoothing)
+            loss = ce_loss(y_pred, y_batch, config.label_smoothing)
         else:
             loss = combo_loss(
-                y_batch,
                 y_pred,
+                y_batch,
                 config.dice_weight,
                 config.ce_weight,
                 config.label_smoothing,
             )
 
-        d_loss = dice_loss(y_batch, y_pred)
+        d_loss = dice_loss(y_pred, y_batch)
 
-        total_loss += float(loss) * len(batch_indices)
-        total_dice += float(1.0 - d_loss) * len(batch_indices)
+        total_loss += loss.item() * len(batch_indices)
+        total_dice += (1.0 - d_loss.item()) * len(batch_indices)
         num_samples += len(batch_indices)
 
     return {
@@ -441,6 +688,12 @@ def train(config: TrainConfig):
     # Set seed
     set_seed(config.seed)
 
+    # Get device
+    device = get_device()
+    logger.info(f"Using device: {device}")
+    if device.type == "cuda":
+        logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
+
     # Load data manifest
     train_csv = Path(config.data_dir) / "train.csv"
     if not train_csv.exists():
@@ -467,20 +720,36 @@ def train(config: TrainConfig):
 
     # Create model
     logger.info("Creating model...")
-    model = get_model(config)
-    num_params = model.count_params()
+    model = get_model(config, device)
+    num_params = count_parameters(model)
     logger.info(f"Model parameters: {num_params:,}")
 
-    # Optimizer with warmup
-    lr_schedule = keras.optimizers.schedules.CosineDecay(
-        initial_learning_rate=config.learning_rate,
-        decay_steps=config.epochs * len(train_dataset) // config.batch_size,
-        alpha=0.01,
+    # Optimizer
+    optimizer = AdamW(
+        model.parameters(),
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
     )
 
-    optimizer = keras.optimizers.AdamW(
-        learning_rate=lr_schedule,
-        weight_decay=config.weight_decay,
+    # Learning rate scheduler with warmup
+    total_steps = config.epochs * len(train_dataset) // config.batch_size
+    warmup_steps = config.warmup_epochs * len(train_dataset) // config.batch_size
+
+    warmup_scheduler = LinearLR(
+        optimizer,
+        start_factor=0.01,
+        end_factor=1.0,
+        total_iters=warmup_steps,
+    )
+    cosine_scheduler = CosineAnnealingLR(
+        optimizer,
+        T_max=total_steps - warmup_steps,
+        eta_min=config.learning_rate * 0.01,
+    )
+    scheduler = SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[warmup_steps],
     )
 
     # Training history
@@ -506,7 +775,7 @@ def train(config: TrainConfig):
 
     # Training loop
     for epoch in range(config.epochs):
-        model.trainable = True
+        model.train()
         epoch_loss = 0.0
         num_batches = 0
 
@@ -516,35 +785,36 @@ def train(config: TrainConfig):
 
         for i in range(0, len(train_indices), config.batch_size):
             batch_indices = train_indices[i : i + config.batch_size]
-            x_batch, y_batch = train_dataset.get_batch(batch_indices)
+            x_batch, y_batch = train_dataset.get_batch(batch_indices, device)
 
-            # Forward pass with gradient tape
-            with keras.backend.GradientTape() as tape:
-                y_pred = model(x_batch, training=True)
+            # Forward pass
+            optimizer.zero_grad()
+            y_pred = model(x_batch)
 
-                if config.loss == "dice":
-                    loss = dice_loss(y_batch, y_pred)
-                elif config.loss == "ce":
-                    loss = ce_loss(y_batch, y_pred, config.label_smoothing)
-                else:
-                    loss = combo_loss(
-                        y_batch,
-                        y_pred,
-                        config.dice_weight,
-                        config.ce_weight,
-                        config.label_smoothing,
-                    )
+            if config.loss == "dice":
+                loss = dice_loss(y_pred, y_batch)
+            elif config.loss == "ce":
+                loss = ce_loss(y_pred, y_batch, config.label_smoothing)
+            else:
+                loss = combo_loss(
+                    y_pred,
+                    y_batch,
+                    config.dice_weight,
+                    config.ce_weight,
+                    config.label_smoothing,
+                )
 
             # Backward pass
-            gradients = tape.gradient(loss, model.trainable_weights)
-            optimizer.apply_gradients(zip(gradients, model.trainable_weights))
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
 
-            epoch_loss += float(loss)
+            epoch_loss += loss.item()
             num_batches += 1
 
             if num_batches % 10 == 0:
                 logger.info(
-                    f"  Epoch {epoch + 1} - Batch {num_batches} - Loss: {float(loss):.4f}"
+                    f"  Epoch {epoch + 1} - Batch {num_batches} - Loss: {loss.item():.4f}"
                 )
 
         avg_loss = epoch_loss / num_batches
@@ -554,7 +824,7 @@ def train(config: TrainConfig):
         # Validation
         if (epoch + 1) % config.eval_every == 0 or epoch + 1 == config.epochs:
             logger.info("Running validation...")
-            val_metrics = compute_val_metrics(model, val_dataset, config)
+            val_metrics = compute_val_metrics(model, val_dataset, config, device)
             history["val_metrics"].append({"epoch": epoch + 1, **val_metrics})
             logger.info(
                 f"Epoch {epoch + 1} - Val Loss: {val_metrics['val_loss']:.4f}, Val Dice: {val_metrics['val_dice']:.4f}"
@@ -563,19 +833,44 @@ def train(config: TrainConfig):
             # Save best model
             if val_metrics["val_dice"] > best_val_dice:
                 best_val_dice = val_metrics["val_dice"]
-                best_path = experiment_dir / "best.weights.h5"
-                model.save_weights(str(best_path))
+                best_path = experiment_dir / "best.pt"
+                torch.save(
+                    {
+                        "epoch": epoch + 1,
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "val_dice": best_val_dice,
+                        "config": config.__dict__,
+                    },
+                    best_path,
+                )
                 logger.info(f"New best model saved! Val Dice: {best_val_dice:.4f}")
 
         # Periodic checkpoint
         if (epoch + 1) % config.save_every == 0:
-            ckpt_path = experiment_dir / f"epoch_{epoch + 1}.weights.h5"
-            model.save_weights(str(ckpt_path))
+            ckpt_path = experiment_dir / f"epoch_{epoch + 1}.pt"
+            torch.save(
+                {
+                    "epoch": epoch + 1,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "config": config.__dict__,
+                },
+                ckpt_path,
+            )
             logger.info(f"Checkpoint saved: {ckpt_path}")
 
     # Save final model and history
-    final_path = experiment_dir / "final.weights.h5"
-    model.save_weights(str(final_path))
+    final_path = experiment_dir / "final.pt"
+    torch.save(
+        {
+            "epoch": config.epochs,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "config": config.__dict__,
+        },
+        final_path,
+    )
 
     history_path = experiment_dir / "history.json"
     with open(history_path, "w") as f:
