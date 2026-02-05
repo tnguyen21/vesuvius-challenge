@@ -90,8 +90,14 @@ echo ""
 
 cd "$PROJECT_DIR"
 
-# Run train.py and capture output
-if python train.py --experiment-name "$EXPERIMENT_NAME" "${TRAIN_ARGS[@]}" 2>&1 | tee "$LOG_DIR/train.log"; then
+# Run train.py and capture output (use uv run if available for correct dependencies)
+if command -v uv &> /dev/null; then
+    PYTHON_CMD="uv run python"
+else
+    PYTHON_CMD="python"
+fi
+
+if $PYTHON_CMD train.py --experiment-name "$EXPERIMENT_NAME" "${TRAIN_ARGS[@]}" 2>&1 | tee "$LOG_DIR/train.log"; then
     TRAIN_SUCCESS=true
     echo -e "${GREEN}Training completed successfully!${NC}"
 else
@@ -205,7 +211,7 @@ entry = {
     'notes': '$NOTES' if '$NOTES' else None,
     'timestamp': '$TIMESTAMP',
     'model_path': 'checkpoints/$EXPERIMENT_NAME/best.weights.h5',
-    'status': 'success' if $TRAIN_SUCCESS else 'failed'
+    'status': 'success' if '$TRAIN_SUCCESS' == 'true' else 'failed'
 }
 # Remove None values for cleaner output
 entry = {k: v for k, v in entry.items() if v is not None}
