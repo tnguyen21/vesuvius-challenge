@@ -58,6 +58,7 @@ class TrainConfig:
     val_split: float = 0.2
     num_patches_per_volume: int = 8  # More patches for faster iteration
     overlap: float = 0.25  # Patch overlap during validation
+    max_samples: int = 0  # 0 = use all samples, >0 = limit total samples (for memory)
 
     # Augmentation
     use_augmentation: bool = True
@@ -761,6 +762,11 @@ def train(config: TrainConfig):
     image_ids = df["id"].tolist()
     logger.info(f"Found {len(image_ids)} samples in train.csv")
 
+    # Apply max_samples limit if set (for memory-constrained systems)
+    if config.max_samples > 0 and len(image_ids) > config.max_samples:
+        logger.info(f"Limiting to {config.max_samples} samples (from {len(image_ids)})")
+        image_ids = image_ids[:config.max_samples]
+
     # Train/val split
     random.shuffle(image_ids)
     val_size = int(len(image_ids) * config.val_split)
@@ -972,6 +978,7 @@ def parse_args():
     # Data
     parser.add_argument("--val-split", type=float, default=0.2)
     parser.add_argument("--patches-per-volume", type=int, default=4)
+    parser.add_argument("--max-samples", type=int, default=0, help="Max samples to load (0=all, for memory limits)")
 
     # Augmentation
     parser.add_argument("--no-augmentation", action="store_true")
@@ -1009,6 +1016,7 @@ def main():
         label_smoothing=args.label_smoothing,
         val_split=args.val_split,
         num_patches_per_volume=args.patches_per_volume,
+        max_samples=args.max_samples,
         use_augmentation=not args.no_augmentation,
         flip_prob=args.flip_prob,
         rotate_prob=args.rotate_prob,
