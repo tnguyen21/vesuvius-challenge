@@ -1,0 +1,47 @@
+[project]
+name = "vesuvius-challenge"
+version = "0.1.0"
+description = "Surface detection in CT scans of Herculaneum scrolls"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    # Image processing
+    "tifffile",
+    "imagecodecs",
+    "scipy",
+    "scikit-image",
+
+    # Data
+    "numpy",
+    "pandas",
+
+    # Visualization
+    "matplotlib",
+
+    # Utilities
+    "tqdm",
+]
+
+[project.optional-dependencies]
+# Full training dependencies (install on GPU VM)
+train = [
+    "keras",
+    "jax[cuda12]",
+    "medicai",
+]
+
+[tool.ruff]
+line-length = 144
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+ignore = ["E501"]  # Line length handled by formatter
+
+[tool.ruff.format]
+quote-style = "double"
+
+[dependency-groups]
+dev = [
+    "ruff",
+]
