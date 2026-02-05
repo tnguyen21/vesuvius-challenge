@@ -25,14 +25,14 @@ ssh -i ~/.ssh/primeintellect_ed25519 root@45.63.87.222 -p 22
 - [x] VM connected (Prime Intellect A100 40GB)
 - [x] Environment setup (uv sync on GPU VM)
 - [x] Data downloaded and verified
-- [x] Baseline experiment running (15 epochs, 300 samples)
-- [ ] Competition metrics evaluation working
+- [x] Baseline experiment completed (Val Dice 0.1373)
+- [x] Competition metrics evaluated (Score 0.3017)
 
 ## Experiment Progress
 
-| Experiment | Val Dice | vs Baseline | Status | Notes |
-|------------|----------|-------------|--------|-------|
-| baseline   | 0.1373   | —           | done   | Simple3DUNet, 128³, 15 epochs, 300 samples |
+| Experiment | Score | Val Dice | Topo | SurfDice | VOI | Status | Notes |
+|------------|-------|----------|------|----------|-----|--------|-------|
+| baseline   | 0.3017 | 0.1373  | 0.73 | 0.21     | 0.03 | done  | Simple3DUNet, 128³, 15 epochs, 300 samples |
 
 ## Key Observations
 
