@@ -49,8 +49,9 @@ def compute_surface_dice(pred: np.ndarray, gt: np.ndarray, tau: float = 2.0) -> 
         Surface Dice score in [0, 1]
     """
     # Get surface voxels (boundary pixels)
-    pred_surface = pred ^ ndimage.binary_erosion(pred)
-    gt_surface = gt ^ ndimage.binary_erosion(gt)
+    # Note: XOR on uint8 returns uint8, need to convert to bool for proper indexing
+    pred_surface = (pred ^ ndimage.binary_erosion(pred)).astype(bool)
+    gt_surface = (gt ^ ndimage.binary_erosion(gt)).astype(bool)
 
     # Compute distance transforms
     pred_dist = distance_transform_edt(~pred_surface)

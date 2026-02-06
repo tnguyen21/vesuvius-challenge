@@ -9,7 +9,6 @@ PyTorch + CUDA implementation.
 import argparse
 import json
 import logging
-import math
 import random
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -25,9 +24,7 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -39,17 +36,18 @@ class TrainConfig:
     experiment_name: str = ""
 
     # Model
-    model_name: str = "TransUNet"
+    model_name: str = "Simple3DUNet"  # "Simple3DUNet" or "TransUNet"
     encoder_name: str = "seresnext50"
-    input_shape: tuple = (160, 160, 160)
+    input_shape: tuple = (128, 128, 128)  # Smaller default for faster baseline
     num_classes: int = 3
+    base_channels: int = 24  # Base channel count for UNet
     classifier_activation: Optional[str] = None  # None for logits, "softmax" for probs
 
     # Training
-    epochs: int = 50
-    batch_size: int = 1
+    epochs: int = 15  # Fewer epochs for baseline
+    batch_size: int = 2  # Can fit larger batch with smaller model
     learning_rate: float = 1e-4
-    warmup_epochs: int = 5
+    warmup_epochs: int = 2  # Shorter warmup
     weight_decay: float = 1e-5
     loss: str = "combo"  # "dice", "ce", "combo"
     dice_weight: float = 0.5
@@ -58,8 +56,9 @@ class TrainConfig:
 
     # Data
     val_split: float = 0.2
-    num_patches_per_volume: int = 4  # Random patches per volume per epoch
+    num_patches_per_volume: int = 8  # More patches for faster iteration
     overlap: float = 0.25  # Patch overlap during validation
+    max_samples: int = 0  # 0 = use all samples, >0 = limit total samples (for memory)
 
     # Augmentation
     use_augmentation: bool = True
@@ -116,9 +115,7 @@ def normalize_volume(volume: np.ndarray) -> np.ndarray:
     return volume
 
 
-def extract_random_patch(
-    volume: np.ndarray, mask: np.ndarray, patch_size: tuple
-) -> tuple:
+def extract_random_patch(volume: np.ndarray, mask: np.ndarray, patch_size: tuple) -> tuple:
     """Extract a random patch from volume and mask."""
     d, h, w = volume.shape
     pd, ph, pw = patch_size
@@ -129,23 +126,15 @@ def extract_random_patch(
     w_start = random.randint(0, max(0, w - pw))
 
     # Extract patches
-    vol_patch = volume[
-        d_start : d_start + pd, h_start : h_start + ph, w_start : w_start + pw
-    ]
-    mask_patch = mask[
-        d_start : d_start + pd, h_start : h_start + ph, w_start : w_start + pw
-    ]
+    vol_patch = volume[d_start : d_start + pd, h_start : h_start + ph, w_start : w_start + pw]
+    mask_patch = mask[d_start : d_start + pd, h_start : h_start + ph, w_start : w_start + pw]
 
     # Pad if necessary
     if vol_patch.shape != patch_size:
         vol_padded = np.zeros(patch_size, dtype=np.float32)
         mask_padded = np.zeros(patch_size, dtype=np.uint8)
-        vol_padded[: vol_patch.shape[0], : vol_patch.shape[1], : vol_patch.shape[2]] = (
-            vol_patch
-        )
-        mask_padded[
-            : mask_patch.shape[0], : mask_patch.shape[1], : mask_patch.shape[2]
-        ] = mask_patch
+        vol_padded[: vol_patch.shape[0], : vol_patch.shape[1], : vol_patch.shape[2]] = vol_patch
+        mask_padded[: mask_patch.shape[0], : mask_patch.shape[1], : mask_patch.shape[2]] = mask_patch
         vol_patch = vol_padded
         mask_patch = mask_padded
 
@@ -227,12 +216,8 @@ class VesuviusDataset:
                 vol = self.volumes[image_id]
                 mask = self.masks[image_id]
 
-                vol_patch, mask_patch = extract_random_patch(
-                    vol, mask, self.config.input_shape
-                )
-                vol_patch, mask_patch = augment_patch(
-                    vol_patch, mask_patch, self.config
-                )
+                vol_patch, mask_patch = extract_random_patch(vol, mask, self.config.input_shape)
+                vol_patch, mask_patch = augment_patch(vol_patch, mask_patch, self.config)
             else:
                 # For validation, use center crop
                 image_id = self.valid_ids[idx]
@@ -262,9 +247,7 @@ class VesuviusDataset:
                 if vol_patch.shape != self.config.input_shape:
                     vol_padded = np.zeros(self.config.input_shape, dtype=np.float32)
                     mask_padded = np.zeros(self.config.input_shape, dtype=np.uint8)
-                    vol_padded[
-                        : vol_patch.shape[0], : vol_patch.shape[1], : vol_patch.shape[2]
-                    ] = vol_patch
+                    vol_padded[: vol_patch.shape[0], : vol_patch.shape[1], : vol_patch.shape[2]] = vol_patch
                     mask_padded[
                         : mask_patch.shape[0],
                         : mask_patch.shape[1],
@@ -328,9 +311,7 @@ class ResBlock3D(nn.Module):
 
     def __init__(self, in_channels, out_channels, stride=1):
         super().__init__()
-        self.conv1 = nn.Conv3d(
-            in_channels, out_channels, kernel_size=3, stride=stride, padding=1
-        )
+        self.conv1 = nn.Conv3d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1)
         self.bn1 = nn.BatchNorm3d(out_channels)
         self.conv2 = nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1)
         self.bn2 = nn.BatchNorm3d(out_channels)
@@ -359,9 +340,7 @@ class TransformerBlock(nn.Module):
     def __init__(self, embed_dim, num_heads, mlp_ratio=4.0, dropout=0.1):
         super().__init__()
         self.norm1 = nn.LayerNorm(embed_dim)
-        self.attn = nn.MultiheadAttention(
-            embed_dim, num_heads, dropout=dropout, batch_first=True
-        )
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
         self.norm2 = nn.LayerNorm(embed_dim)
         self.mlp = nn.Sequential(
             nn.Linear(embed_dim, int(embed_dim * mlp_ratio)),
@@ -414,33 +393,20 @@ class TransUNet3D(nn.Module):
 
         # Transformer layers
         embed_dim = base_channels * 16
-        self.transformer_layers = nn.ModuleList(
-            [
-                TransformerBlock(embed_dim, num_heads)
-                for _ in range(num_transformer_layers)
-            ]
-        )
+        self.transformer_layers = nn.ModuleList([TransformerBlock(embed_dim, num_heads) for _ in range(num_transformer_layers)])
         self.transformer_norm = nn.LayerNorm(embed_dim)
 
         # Decoder
-        self.up4 = nn.ConvTranspose3d(
-            base_channels * 16, base_channels * 8, kernel_size=2, stride=2
-        )
+        self.up4 = nn.ConvTranspose3d(base_channels * 16, base_channels * 8, kernel_size=2, stride=2)
         self.dec4 = ConvBlock3D(base_channels * 16, base_channels * 8)
 
-        self.up3 = nn.ConvTranspose3d(
-            base_channels * 8, base_channels * 4, kernel_size=2, stride=2
-        )
+        self.up3 = nn.ConvTranspose3d(base_channels * 8, base_channels * 4, kernel_size=2, stride=2)
         self.dec3 = ConvBlock3D(base_channels * 8, base_channels * 4)
 
-        self.up2 = nn.ConvTranspose3d(
-            base_channels * 4, base_channels * 2, kernel_size=2, stride=2
-        )
+        self.up2 = nn.ConvTranspose3d(base_channels * 4, base_channels * 2, kernel_size=2, stride=2)
         self.dec2 = ConvBlock3D(base_channels * 4, base_channels * 2)
 
-        self.up1 = nn.ConvTranspose3d(
-            base_channels * 2, base_channels, kernel_size=2, stride=2
-        )
+        self.up1 = nn.ConvTranspose3d(base_channels * 2, base_channels, kernel_size=2, stride=2)
         self.dec1 = ConvBlock3D(base_channels * 2, base_channels)
 
         # Output
@@ -467,6 +433,87 @@ class TransUNet3D(nn.Module):
 
         # Reshape back: (B, D*H*W, C) -> (B, C, D, H, W)
         b = b_flat.transpose(1, 2).view(b_shape)
+
+        # Decoder with skip connections
+        d4 = self.up4(b)
+        d4 = torch.cat([d4, e4], dim=1)
+        d4 = self.dec4(d4)
+
+        d3 = self.up3(d4)
+        d3 = torch.cat([d3, e3], dim=1)
+        d3 = self.dec3(d3)
+
+        d2 = self.up2(d3)
+        d2 = torch.cat([d2, e2], dim=1)
+        d2 = self.dec2(d2)
+
+        d1 = self.up1(d2)
+        d1 = torch.cat([d1, e1], dim=1)
+        d1 = self.dec1(d1)
+
+        out = self.out_conv(d1)
+
+        if self.classifier_activation == "softmax":
+            out = F.softmax(out, dim=1)
+
+        return out
+
+
+class Simple3DUNet(nn.Module):
+    """
+    Simple 3D UNet for baseline experiments.
+    No transformer layers, no SE-attention, just vanilla UNet.
+    ~2.5M params with base_channels=24 (vs ~10M for TransUNet3D).
+    """
+
+    def __init__(
+        self,
+        in_channels=1,
+        num_classes=3,
+        base_channels=24,
+        classifier_activation=None,
+    ):
+        super().__init__()
+        self.classifier_activation = classifier_activation
+        bc = base_channels
+
+        # Encoder
+        self.enc1 = ConvBlock3D(in_channels, bc)
+        self.enc2 = ConvBlock3D(bc, bc * 2)
+        self.enc3 = ConvBlock3D(bc * 2, bc * 4)
+        self.enc4 = ConvBlock3D(bc * 4, bc * 8)
+
+        # Bottleneck
+        self.bottleneck = ConvBlock3D(bc * 8, bc * 16)
+
+        # Decoder
+        self.up4 = nn.ConvTranspose3d(bc * 16, bc * 8, kernel_size=2, stride=2)
+        self.dec4 = ConvBlock3D(bc * 16, bc * 8)
+
+        self.up3 = nn.ConvTranspose3d(bc * 8, bc * 4, kernel_size=2, stride=2)
+        self.dec3 = ConvBlock3D(bc * 8, bc * 4)
+
+        self.up2 = nn.ConvTranspose3d(bc * 4, bc * 2, kernel_size=2, stride=2)
+        self.dec2 = ConvBlock3D(bc * 4, bc * 2)
+
+        self.up1 = nn.ConvTranspose3d(bc * 2, bc, kernel_size=2, stride=2)
+        self.dec1 = ConvBlock3D(bc * 2, bc)
+
+        # Output
+        self.out_conv = nn.Conv3d(bc, num_classes, kernel_size=1)
+
+        # Pooling
+        self.pool = nn.MaxPool3d(2)
+
+    def forward(self, x):
+        # Encoder
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+        e4 = self.enc4(self.pool(e3))
+
+        # Bottleneck
+        b = self.bottleneck(self.pool(e4))
 
         # Decoder with skip connections
         d4 = self.up4(b)
@@ -521,9 +568,7 @@ def dice_loss(y_pred: torch.Tensor, y_true: torch.Tensor, smooth: float = 1e-6):
     return 1.0 - dice[:, 1:].mean()
 
 
-def ce_loss(
-    y_pred: torch.Tensor, y_true: torch.Tensor, label_smoothing: float = 0.0
-):
+def ce_loss(y_pred: torch.Tensor, y_true: torch.Tensor, label_smoothing: float = 0.0):
     """
     Compute cross-entropy loss ignoring unlabeled pixels.
 
@@ -540,9 +585,7 @@ def ce_loss(
     y_true_clamped = y_true.clamp(0, num_classes - 1)
 
     # Compute per-pixel loss
-    loss = F.cross_entropy(
-        y_pred, y_true_clamped, reduction="none", label_smoothing=label_smoothing
-    )
+    loss = F.cross_entropy(y_pred, y_true_clamped, reduction="none", label_smoothing=label_smoothing)
 
     # Apply mask and compute mean
     masked_loss = loss * valid_mask
@@ -564,14 +607,24 @@ def combo_loss(
 
 def get_model(config: TrainConfig, device: torch.device) -> nn.Module:
     """Create and return the model."""
-    model = TransUNet3D(
-        in_channels=1,
-        num_classes=config.num_classes,
-        base_channels=32,
-        num_transformer_layers=4,
-        num_heads=8,
-        classifier_activation=config.classifier_activation,
-    )
+    if config.model_name == "Simple3DUNet":
+        model = Simple3DUNet(
+            in_channels=1,
+            num_classes=config.num_classes,
+            base_channels=config.base_channels,
+            classifier_activation=config.classifier_activation,
+        )
+    elif config.model_name == "TransUNet":
+        model = TransUNet3D(
+            in_channels=1,
+            num_classes=config.num_classes,
+            base_channels=32,  # TransUNet uses fixed 32 base channels
+            num_transformer_layers=4,
+            num_heads=8,
+            classifier_activation=config.classifier_activation,
+        )
+    else:
+        raise ValueError(f"Unknown model: {config.model_name}")
     return model.to(device)
 
 
@@ -639,6 +692,7 @@ def print_config(config: TrainConfig):
         "Model:",
         f"  model_name:       {config.model_name}",
         f"  encoder_name:     {config.encoder_name}",
+        f"  base_channels:    {config.base_channels}",
         f"  input_shape:      {config.input_shape}",
         f"  num_classes:      {config.num_classes}",
         f"  activation:       {config.classifier_activation or 'None (logits)'}",
@@ -693,6 +747,11 @@ def train(config: TrainConfig):
     logger.info(f"Using device: {device}")
     if device.type == "cuda":
         logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
+        # Enable TF32 for faster training on Ampere+ GPUs
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        logger.info("Enabled TF32 and cuDNN benchmark")
 
     # Load data manifest
     train_csv = Path(config.data_dir) / "train.csv"
@@ -702,6 +761,11 @@ def train(config: TrainConfig):
     df = pd.read_csv(train_csv)
     image_ids = df["id"].tolist()
     logger.info(f"Found {len(image_ids)} samples in train.csv")
+
+    # Apply max_samples limit if set (for memory-constrained systems)
+    if config.max_samples > 0 and len(image_ids) > config.max_samples:
+        logger.info(f"Limiting to {config.max_samples} samples (from {len(image_ids)})")
+        image_ids = image_ids[:config.max_samples]
 
     # Train/val split
     random.shuffle(image_ids)
@@ -757,6 +821,7 @@ def train(config: TrainConfig):
         "config": {
             "model_name": config.model_name,
             "encoder_name": config.encoder_name,
+            "base_channels": config.base_channels,
             "input_shape": config.input_shape,
             "num_classes": config.num_classes,
             "epochs": config.epochs,
@@ -813,9 +878,7 @@ def train(config: TrainConfig):
             num_batches += 1
 
             if num_batches % 10 == 0:
-                logger.info(
-                    f"  Epoch {epoch + 1} - Batch {num_batches} - Loss: {loss.item():.4f}"
-                )
+                logger.info(f"  Epoch {epoch + 1} - Batch {num_batches} - Loss: {loss.item():.4f}")
 
         avg_loss = epoch_loss / num_batches
         history["train_loss"].append(avg_loss)
@@ -826,9 +889,7 @@ def train(config: TrainConfig):
             logger.info("Running validation...")
             val_metrics = compute_val_metrics(model, val_dataset, config, device)
             history["val_metrics"].append({"epoch": epoch + 1, **val_metrics})
-            logger.info(
-                f"Epoch {epoch + 1} - Val Loss: {val_metrics['val_loss']:.4f}, Val Dice: {val_metrics['val_dice']:.4f}"
-            )
+            logger.info(f"Epoch {epoch + 1} - Val Loss: {val_metrics['val_loss']:.4f}, Val Dice: {val_metrics['val_dice']:.4f}")
 
             # Save best model
             if val_metrics["val_dice"] > best_val_dice:
@@ -883,9 +944,7 @@ def train(config: TrainConfig):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Train TransUNet for Vesuvius surface detection"
-    )
+    parser = argparse.ArgumentParser(description="Train TransUNet for Vesuvius surface detection")
 
     # Paths
     parser.add_argument("--data-dir", type=str, default="data")
@@ -894,11 +953,15 @@ def parse_args():
 
     # Model
     parser.add_argument(
-        "--encoder", type=str, default="seresnext50", help="Encoder backbone"
+        "--model",
+        type=str,
+        default="Simple3DUNet",
+        choices=["Simple3DUNet", "TransUNet"],
+        help="Model architecture",
     )
-    parser.add_argument(
-        "--input-size", type=int, default=160, help="Input patch size (cubic)"
-    )
+    parser.add_argument("--encoder", type=str, default="seresnext50", help="Encoder backbone (TransUNet only)")
+    parser.add_argument("--input-size", type=int, default=128, help="Input patch size (cubic)")
+    parser.add_argument("--base-channels", type=int, default=24, help="Base channels for UNet")
     parser.add_argument("--num-classes", type=int, default=3)
 
     # Training
@@ -907,9 +970,7 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--warmup-epochs", type=int, default=5)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
-    parser.add_argument(
-        "--loss", type=str, default="combo", choices=["dice", "ce", "combo"]
-    )
+    parser.add_argument("--loss", type=str, default="combo", choices=["dice", "ce", "combo"])
     parser.add_argument("--dice-weight", type=float, default=0.5)
     parser.add_argument("--ce-weight", type=float, default=0.5)
     parser.add_argument("--label-smoothing", type=float, default=0.0)
@@ -917,6 +978,7 @@ def parse_args():
     # Data
     parser.add_argument("--val-split", type=float, default=0.2)
     parser.add_argument("--patches-per-volume", type=int, default=4)
+    parser.add_argument("--max-samples", type=int, default=0, help="Max samples to load (0=all, for memory limits)")
 
     # Augmentation
     parser.add_argument("--no-augmentation", action="store_true")
@@ -938,9 +1000,11 @@ def main():
         data_dir=args.data_dir,
         output_dir=args.output_dir,
         experiment_name=args.experiment_name,
+        model_name=args.model,
         encoder_name=args.encoder,
         input_shape=(args.input_size, args.input_size, args.input_size),
         num_classes=args.num_classes,
+        base_channels=args.base_channels,
         epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.lr,
@@ -952,6 +1016,7 @@ def main():
         label_smoothing=args.label_smoothing,
         val_split=args.val_split,
         num_patches_per_volume=args.patches_per_volume,
+        max_samples=args.max_samples,
         use_augmentation=not args.no_augmentation,
         flip_prob=args.flip_prob,
         rotate_prob=args.rotate_prob,

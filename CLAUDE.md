@@ -240,20 +240,22 @@ The competition uses three metrics with specific weights:
 
 ### Evaluation Workflow
 
+**IMPORTANT**: Always run eval after experiments to get competition metrics for the PR.
+
 After training completes:
 
 ```bash
-# 1. Generate predictions on validation set
-python vesuvius_predictions.py --weights checkpoints/<name>/best.weights.h5 --output output/<name>
+# 1. Generate predictions on training set (for evaluation)
+uv run python vesuvius_predictions.py --weights checkpoints/<name>/best.pt --input-dir data/train_images --output output/<name> --no-tta
 
 # 2. Compute competition metrics
-python scripts/eval_metrics.py --pred output/<name> --gt data/train_labels
+uv run python scripts/eval_metrics.py --pred output/<name> --gt data/train_labels
 
 # 3. Update experiment log with competition metrics
-python scripts/eval_metrics.py --pred output/<name> --gt data/train_labels --update-log <name>
+uv run python scripts/eval_metrics.py --pred output/<name> --gt data/train_labels --update-log <name>
 ```
 
-**Note**: The training script only computes internal metrics (val_dice, val_loss). Competition metrics must be computed separately after generating predictions.
+**Note**: The training script only computes internal metrics (val_dice, val_loss). Competition metrics (TopoScore, SurfaceDice, VOI) must be computed separately after generating predictions.
 
 ### Metric Interpretation
 

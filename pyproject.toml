@@ -20,14 +20,9 @@ dependencies = [
 
     # Utilities
     "tqdm",
-]
 
-[project.optional-dependencies]
-# Full training dependencies (install on GPU VM)
-train = [
-    "keras",
-    "jax[cuda12]",
-    "medicai",
+    # Deep learning (PyTorch)
+    "torch>=2.0",
 ]
 
 [tool.ruff]
