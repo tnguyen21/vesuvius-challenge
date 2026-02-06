@@ -765,7 +765,7 @@ def train(config: TrainConfig):
     # Apply max_samples limit if set (for memory-constrained systems)
     if config.max_samples > 0 and len(image_ids) > config.max_samples:
         logger.info(f"Limiting to {config.max_samples} samples (from {len(image_ids)})")
-        image_ids = image_ids[:config.max_samples]
+        image_ids = image_ids[: config.max_samples]
 
     # Train/val split
     random.shuffle(image_ids)

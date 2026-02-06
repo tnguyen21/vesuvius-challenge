@@ -26,48 +26,62 @@ def print_status():
     """Print experiment status."""
     experiments = load_experiments()
 
-    print("=" * 70)
+    print("=" * 80)
     print("EXPERIMENT STATUS")
-    print("=" * 70)
+    print("=" * 80)
 
     if not experiments:
         print("\nNo experiments yet. Run your first experiment:")
-        print("  ./run_experiment.sh baseline google/byt5-small 10 8 5e-5")
-        print("=" * 70)
+        print("  ./scripts/run_experiment.sh baseline --epochs 15")
+        print("=" * 80)
         return
 
     print(f"\nTotal experiments: {len(experiments)}")
     print()
 
-    # Sort by geom_mean
-    sorted_exps = sorted(experiments, key=lambda x: x.get("metrics", {}).get("geom_mean", 0), reverse=True)
+    # Sort by combined score
+    sorted_exps = sorted(
+        experiments,
+        key=lambda x: x.get("metrics", {}).get("score", 0) or 0,
+        reverse=True,
+    )
 
     # Print leaderboard
-    print("LEADERBOARD (by GeomMean):")
-    print("-" * 70)
-    print(f"{'Rank':<5} {'Experiment':<25} {'BLEU':<10} {'chrF++':<10} {'GeomMean':<10}")
-    print("-" * 70)
+    print("LEADERBOARD (by Score = 0.30*Topo + 0.35*SurfDice + 0.35*VOI):")
+    print("-" * 80)
+    print(f"{'Rank':<5} {'Experiment':<20} {'Score':<8} {'Topo':<8} {'SurfDice':<10} {'VOI':<8} {'ValDice':<8}")
+    print("-" * 80)
 
     for i, exp in enumerate(sorted_exps[:10], 1):
         metrics = exp.get("metrics", {})
-        print(f"{i:<5} {exp['id']:<25} {metrics.get('bleu', 0):>8.2f}  {metrics.get('chrf++', 0):>8.2f}  {metrics.get('geom_mean', 0):>8.2f}")
+        score = metrics.get("score", 0) or 0
+        topo = metrics.get("topo_score", 0) or 0
+        sdice = metrics.get("surface_dice", 0) or 0
+        voi = metrics.get("voi_score", 0) or 0
+        vdice = metrics.get("val_dice", 0) or 0
+        print(f"{i:<5} {exp['name']:<20} {score:>6.4f}  {topo:>6.4f}  {sdice:>8.4f}  {voi:>6.4f}  {vdice:>6.4f}")
 
-    print("-" * 70)
+    print("-" * 80)
 
     # Best experiment details
     best = sorted_exps[0] if sorted_exps else None
     if best:
-        print(f"\nBEST EXPERIMENT: {best['id']}")
-        print(f"  Model: {best.get('config', {}).get('model_name', 'N/A')}")
-        print(f"  Epochs: {best.get('config', {}).get('epochs', 'N/A')}")
-        print(f"  Batch Size: {best.get('config', {}).get('batch_size', 'N/A')}")
-        print(f"  Learning Rate: {best.get('config', {}).get('learning_rate', 'N/A')}")
-        print(f"  Model Path: {best.get('model_path', 'N/A')}")
+        print(f"\nBEST EXPERIMENT: {best['name']}")
+        cfg = best.get("config", {})
+        print(f"  Model:         {cfg.get('model', 'N/A')}")
+        print(f"  Base Channels: {cfg.get('base_channels', 'N/A')}")
+        print(f"  Input Shape:   {cfg.get('input_shape', 'N/A')}")
+        print(f"  Epochs:        {cfg.get('epochs', 'N/A')}")
+        print(f"  Batch Size:    {cfg.get('batch_size', 'N/A')}")
+        print(f"  Learning Rate: {cfg.get('learning_rate', 'N/A')}")
+        print(f"  Loss:          {cfg.get('loss', 'N/A')}")
+        print(f"  Runtime:       {best.get('runtime_mins', 'N/A')} min")
+        print(f"  Model Path:    {best.get('model_path', 'N/A')}")
 
     # Suggestions
-    print("\n" + "=" * 70)
+    print("\n" + "=" * 80)
     print("SUGGESTED NEXT STEPS")
-    print("=" * 70)
+    print("=" * 80)
 
     suggestions = generate_suggestions(experiments)
     for i, suggestion in enumerate(suggestions, 1):
@@ -76,7 +90,7 @@ def print_status():
         if suggestion.get("command"):
             print(f"   Command: {suggestion['command']}")
 
-    print("\n" + "=" * 70)
+    print("\n" + "=" * 80)
 
 
 def generate_suggestions(experiments: list[dict]) -> list[dict]:
@@ -87,68 +101,77 @@ def generate_suggestions(experiments: list[dict]) -> list[dict]:
         suggestions.append(
             {
                 "title": "Run baseline experiment",
-                "description": "Start with byt5-small to establish a baseline",
-                "command": "./run_experiment.sh baseline google/byt5-small 10 8 5e-5",
+                "description": "Start with Simple3DUNet to establish a baseline",
+                "command": "./scripts/run_experiment.sh baseline --epochs 15",
             }
         )
         return suggestions
 
-    best = max(experiments, key=lambda x: x.get("metrics", {}).get("geom_mean", 0))
-    best_geom = best.get("metrics", {}).get("geom_mean", 0)
-    best_config = best.get("config", {})
+    best = max(
+        experiments,
+        key=lambda x: x.get("metrics", {}).get("score", 0) or 0,
+    )
+    best_score = best.get("metrics", {}).get("score", 0) or 0
 
     # Check what's been tried
-    models_tried = {e.get("config", {}).get("model_name") for e in experiments}
-    epochs_tried = {e.get("config", {}).get("epochs") for e in experiments}
-    lrs_tried = {e.get("config", {}).get("learning_rate") for e in experiments}
+    models_tried = {e.get("config", {}).get("model") for e in experiments}
+    batch_sizes_tried = {e.get("config", {}).get("batch_size") for e in experiments}
+    input_shapes = {tuple(e.get("config", {}).get("input_shape", [])) for e in experiments if e.get("config", {}).get("input_shape")}
 
-    # Model size suggestions
-    if "google/byt5-small" in models_tried and "google/byt5-base" not in models_tried:
+    # Lazy loading (train on all samples)
+    max_samples_used = max(
+        (e.get("config", {}).get("max_samples", 0) or 0 for e in experiments),
+        default=0,
+    )
+    if max_samples_used > 0:
         suggestions.append(
             {
-                "title": "Try larger model (byt5-base)",
-                "description": "Current best uses byt5-small. byt5-base may improve quality.",
-                "command": "./run_experiment.sh byt5_base google/byt5-base 10 4 3e-5",
-            }
-        )
-
-    # Epoch suggestions
-    max_epochs = max(epochs_tried) if epochs_tried else 0
-    if max_epochs < 20:
-        suggestions.append(
-            {
-                "title": "Train longer",
-                "description": f"Current max epochs: {max_epochs}. Try more training.",
-                "command": f"./run_experiment.sh longer_{max_epochs * 2}ep {best_config.get('model_name', 'google/byt5-small')} {max_epochs * 2} {best_config.get('batch_size', 8)} {best_config.get('learning_rate', 5e-5)}",
-            }
-        )
-
-    # Learning rate suggestions
-    if len(lrs_tried) < 3:
-        suggestions.append(
-            {
-                "title": "Try different learning rates",
-                "description": "Learning rate tuning often helps significantly",
-                "command": "./run_experiment.sh lr_1e4 google/byt5-small 10 8 1e-4",
-            }
-        )
-
-    # Data augmentation
-    if best_geom > 0 and len(experiments) >= 3:
-        suggestions.append(
-            {
-                "title": "Add data augmentation",
-                "description": "Consider back-translation or noise injection for more training data",
+                "title": "Implement lazy loading",
+                "description": (f"Currently limited to {max_samples_used} samples. Lazy loading enables training on all 806 samples."),
                 "command": None,
             }
         )
 
-    # Ensemble
-    if len(experiments) >= 5:
+    # Larger batch size
+    if batch_sizes_tried <= {1}:
         suggestions.append(
             {
-                "title": "Try ensembling",
-                "description": "Combine predictions from top models",
+                "title": "Increase batch size",
+                "description": "Batch size 1 gives noisy gradients. Try batch 4 with scaled LR.",
+                "command": ("./scripts/run_experiment.sh batch4 --batch-size 4 --lr 2e-4 --epochs 15"),
+            }
+        )
+
+    # Model upgrade
+    if "TransUNet" not in models_tried:
+        suggestions.append(
+            {
+                "title": "Try TransUNet model",
+                "description": ("TransUNet adds transformer bottleneck + SE attention (~10M params). May capture longer-range dependencies."),
+                "command": ("./scripts/run_experiment.sh transunet --model TransUNet --base-channels 32 --batch-size 4 --lr 1e-4 --epochs 15"),
+            }
+        )
+
+    # Larger patches
+    if (160, 160, 160) not in input_shapes:
+        suggestions.append(
+            {
+                "title": "Increase patch size to 160",
+                "description": ("Larger patches provide more spatial context. May help with surface continuity and topology."),
+                "command": ("./scripts/run_experiment.sh patch160 --input-size 160 --batch-size 2 --epochs 30"),
+            }
+        )
+
+    # Longer training
+    max_epochs = max(
+        (e.get("config", {}).get("epochs", 0) or 0 for e in experiments),
+        default=0,
+    )
+    if max_epochs < 30:
+        suggestions.append(
+            {
+                "title": "Train longer",
+                "description": f"Current max epochs: {max_epochs}. Try 30+ epochs.",
                 "command": None,
             }
         )
@@ -157,7 +180,7 @@ def generate_suggestions(experiments: list[dict]) -> list[dict]:
         suggestions.append(
             {
                 "title": "Continue experimenting",
-                "description": "Try different hyperparameters or model architectures",
+                "description": (f"Best score: {best_score:.4f}. Try topology-aware loss, post-processing tuning, or ensembling."),
                 "command": None,
             }
         )
