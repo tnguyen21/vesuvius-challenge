@@ -379,7 +379,9 @@ def main():
 
         print("\nPer-volume results:")
         for vol_id, metrics in results["per_volume"].items():
-            print(f"  {vol_id}: score={metrics['score']:.4f} (topo={metrics['topo_score']:.4f}, surf={metrics['surface_dice']:.4f}, voi={metrics['voi_score']:.4f})")
+            print(
+                f"  {vol_id}: score={metrics['score']:.4f} (topo={metrics['topo_score']:.4f}, surf={metrics['surface_dice']:.4f}, voi={metrics['voi_score']:.4f})"
+            )
 
         print("\nAverage results:")
         avg = results["average"]

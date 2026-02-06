@@ -210,7 +210,7 @@ entry = {
     'runtime_mins': $RUNTIME_MINS,
     'notes': '$NOTES' if '$NOTES' else None,
     'timestamp': '$TIMESTAMP',
-    'model_path': 'checkpoints/$EXPERIMENT_NAME/best.weights.h5',
+    'model_path': 'checkpoints/$EXPERIMENT_NAME/best.pt',
     'status': 'success' if '$TRAIN_SUCCESS' == 'true' else 'failed'
 }
 # Remove None values for cleaner output
@@ -239,7 +239,7 @@ echo ""
 echo "Log entry appended to: $LOG_FILE"
 echo ""
 echo -e "${YELLOW}Next steps:${NC}"
-echo "  1. Run predictions: python vesuvius_predictions.py --weights checkpoints/$EXPERIMENT_NAME/best.weights.h5"
+echo "  1. Run predictions: python vesuvius_predictions.py --weights checkpoints/$EXPERIMENT_NAME/best.pt"
 echo "  2. Evaluate competition metrics: python scripts/eval_metrics.py --pred output/$EXPERIMENT_NAME --gt data/train_labels"
 echo "  3. Update experiments/log.jsonl with competition metrics (topo_score, surface_dice, voi_score)"
 echo "  4. Run 'python experiments/status.py' to see leaderboard and suggestions"
