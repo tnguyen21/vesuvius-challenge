@@ -33,6 +33,7 @@ ssh -i ~/.ssh/primeintellect_ed25519 root@45.63.87.222 -p 22
 | Experiment | Score | Val Dice | Topo | SurfDice | VOI | Status | Notes |
 |------------|-------|----------|------|----------|-----|--------|-------|
 | baseline   | 0.3017 | 0.1373  | 0.73 | 0.21     | 0.03 | done  | Simple3DUNet, 128³, 15 epochs, 300 samples |
+| lazy_loading | TBD | 0.1496 | TBD | TBD | TBD | done | Full dataset (634 train/152 val), LRU cache, +9% Val Dice |
 
 ## Key Observations
 
