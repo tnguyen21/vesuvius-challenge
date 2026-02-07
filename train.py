@@ -7,6 +7,7 @@ PyTorch + CUDA implementation.
 """
 
 import argparse
+import collections
 import json
 import logging
 import random
@@ -59,6 +60,7 @@ class TrainConfig:
     num_patches_per_volume: int = 8  # More patches for faster iteration
     overlap: float = 0.25  # Patch overlap during validation
     max_samples: int = 0  # 0 = use all samples, >0 = limit total samples (for memory)
+    cache_size: int = 32  # Number of volumes to keep in LRU cache (0 = unlimited)
 
     # Augmentation
     use_augmentation: bool = True
@@ -176,26 +178,43 @@ class VesuviusDataset:
         self.config = config
         self.is_train = is_train
 
-        # Pre-load and cache volumes (they're not too large)
-        logger.info(f"Loading {len(image_ids)} volumes...")
-        self.volumes = {}
-        self.masks = {}
-
+        # Lazy loading: only scan filesystem for valid pairs, load on demand
+        self.valid_ids = []
         for image_id in image_ids:
             vol_path = self.data_dir / "train_images" / f"{image_id}.tif"
             mask_path = self.data_dir / "train_labels" / f"{image_id}.tif"
-
             if vol_path.exists() and mask_path.exists():
-                vol = load_volume(str(vol_path))
-                vol = normalize_volume(vol)
-                mask = tifffile.imread(str(mask_path)).astype(np.uint8)
+                self.valid_ids.append(image_id)
 
-                self.volumes[image_id] = vol
-                self.masks[image_id] = mask
-                logger.info(f"  Loaded {image_id}: {vol.shape}")
+        logger.info(f"Found {len(self.valid_ids)} valid volumes (lazy loading, cache_size={config.cache_size})")
 
-        self.valid_ids = list(self.volumes.keys())
-        logger.info(f"Loaded {len(self.valid_ids)} valid volumes")
+        # LRU cache: OrderedDict maintains insertion order, evict oldest when full
+        self._cache: collections.OrderedDict[str, tuple[np.ndarray, np.ndarray]] = collections.OrderedDict()
+        self._cache_size = config.cache_size
+        self._cache_hits = 0
+        self._cache_misses = 0
+
+    def _load_volume(self, image_id: str) -> tuple[np.ndarray, np.ndarray]:
+        """Load a volume+mask pair, using LRU cache."""
+        if image_id in self._cache:
+            self._cache.move_to_end(image_id)
+            self._cache_hits += 1
+            return self._cache[image_id]
+
+        self._cache_misses += 1
+        vol_path = self.data_dir / "train_images" / f"{image_id}.tif"
+        mask_path = self.data_dir / "train_labels" / f"{image_id}.tif"
+
+        vol = load_volume(str(vol_path))
+        vol = normalize_volume(vol)
+        mask = tifffile.imread(str(mask_path)).astype(np.uint8)
+
+        # Evict oldest if cache is full
+        if self._cache_size > 0 and len(self._cache) >= self._cache_size:
+            self._cache.popitem(last=False)
+
+        self._cache[image_id] = (vol, mask)
+        return vol, mask
 
     def __len__(self):
         if self.is_train:
@@ -213,16 +232,14 @@ class VesuviusDataset:
                 vol_idx = idx % len(self.valid_ids)
                 image_id = self.valid_ids[vol_idx]
 
-                vol = self.volumes[image_id]
-                mask = self.masks[image_id]
+                vol, mask = self._load_volume(image_id)
 
                 vol_patch, mask_patch = extract_random_patch(vol, mask, self.config.input_shape)
                 vol_patch, mask_patch = augment_patch(vol_patch, mask_patch, self.config)
             else:
                 # For validation, use center crop
                 image_id = self.valid_ids[idx]
-                vol = self.volumes[image_id]
-                mask = self.masks[image_id]
+                vol, mask = self._load_volume(image_id)
 
                 # Center crop
                 d, h, w = vol.shape
@@ -618,7 +635,7 @@ def get_model(config: TrainConfig, device: torch.device) -> nn.Module:
         model = TransUNet3D(
             in_channels=1,
             num_classes=config.num_classes,
-            base_channels=32,  # TransUNet uses fixed 32 base channels
+            base_channels=config.base_channels,
             num_transformer_layers=4,
             num_heads=8,
             classifier_activation=config.classifier_activation,
@@ -979,6 +996,7 @@ def parse_args():
     parser.add_argument("--val-split", type=float, default=0.2)
     parser.add_argument("--patches-per-volume", type=int, default=4)
     parser.add_argument("--max-samples", type=int, default=0, help="Max samples to load (0=all, for memory limits)")
+    parser.add_argument("--cache-size", type=int, default=32, help="LRU cache size for lazy volume loading (0=unlimited)")
 
     # Augmentation
     parser.add_argument("--no-augmentation", action="store_true")
@@ -1017,6 +1035,7 @@ def main():
         val_split=args.val_split,
         num_patches_per_volume=args.patches_per_volume,
         max_samples=args.max_samples,
+        cache_size=args.cache_size,
         use_augmentation=not args.no_augmentation,
         flip_prob=args.flip_prob,
         rotate_prob=args.rotate_prob,
